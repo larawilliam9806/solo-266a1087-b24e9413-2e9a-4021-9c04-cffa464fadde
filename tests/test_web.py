@@ -329,3 +329,144 @@ def test_import_rejects_bad_jump_target(client):
     jumps = dict(JUMPS, jumps={"Q1": {"租赁": "Q99"}})
     response = upload(client, jumps=jumps)
     assert "导入失败" in response.get_data(as_text=True)
+
+
+def test_interrupted_import_leaves_no_partial_batch(client, monkeypatch):
+    """A write failure mid-import must leave no batch and no orphan rows."""
+    upload(client)  # seed a good batch 1
+    import main
+    original = main.storage.write_households
+    calls = {"n": 0}
+
+    def flaky(connection, batch_id, households):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise sqlite3.OperationalError("disk full")
+        return original(connection, batch_id, households)
+
+    monkeypatch.setattr(main.storage, "write_households", flaky)
+    monkeypatch.setattr(main, "IMPORT_CHUNK", 2)
+    response = client.post("/upload", data={
+        "csv_file": (io.BytesIO(CSV_TEXT.encode()), "answers.csv"),
+        "json_file": (io.BytesIO(json.dumps(JUMPS).encode()), "jumps.json"),
+        "batch_name": "坏导入",
+    }, content_type="multipart/form-data", follow_redirects=True)
+    body = response.get_data(as_text=True)
+    assert "导入失败" in body
+    assert "坏导入" not in body  # not listed as a batch
+
+    # The existing batch is untouched and downloadable.
+    assert client.get("/batch/1").status_code == 200
+    export = client.get("/batch/1/export.csv").data.decode("utf-8-sig")
+    assert "H2" in export and "8000" in export
+    # Nothing was left behind by the failed import.
+    connection = main.get_db()
+    try:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM batches").fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM households").fetchone()[0] == 4
+        assert connection.execute(
+            "SELECT COUNT(*) FROM answers").fetchone()[0] > 0
+    finally:
+        connection.close()
+
+
+def test_importing_batch_not_visible_until_complete(client, monkeypatch):
+    """During the write phase, the new batch is not on the index or viewable."""
+    import main
+    seen = {}
+    original = main.storage.write_households
+
+    def observe(connection, batch_id, households):
+        if "first" not in seen:
+            seen["first"] = True
+            index = main.app.test_client().get("/").get_data(as_text=True)
+            seen["index"] = index
+            seen["status"] = main.app.test_client().get(
+                "/batch/%d" % batch_id).status_code
+        return original(connection, batch_id, households)
+
+    monkeypatch.setattr(main.storage, "write_households", observe)
+    monkeypatch.setattr(main, "IMPORT_CHUNK", 2)
+    upload(client)
+    assert seen["status"] == 404
+    assert "answers" not in seen["index"].split("已有批次")[1]
+    # And it becomes visible once the import completes.
+    assert client.get("/batch/1").status_code == 200
+
+
+def test_failed_import_can_be_retried(client, monkeypatch):
+    import main
+    original = main.storage.write_households
+    monkeypatch.setattr(main.storage, "write_households",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            sqlite3.OperationalError("locked")))
+    upload(client)
+    assert client.get("/batch/1").status_code == 404
+    assert "还没有批次" in client.get("/").get_data(as_text=True)
+    monkeypatch.setattr(main.storage, "write_households", original)
+    body = upload(client).get_data(as_text=True)
+    assert "已导入 4 户" in body
+    assert client.get("/batch/2").status_code == 200
+
+
+def test_duplicate_household_across_chunks_keeps_first(client, monkeypatch):
+    import main
+    monkeypatch.setattr(main, "IMPORT_CHUNK", 1)
+    csv_text = ("户号,Q1 设备来源,Q2 自购设备类型,Q3 自购台数,"
+                "Q4 是否享受购置补贴,Q5 租赁方式,Q6 租赁台数,"
+                "Q7 年费用合计（元）\n"
+                "H1,自购,喷药机,2,无,,,12000\n"
+                "H1,租赁,,,,按年整租,3,8000\n")
+    upload(client, csv_text=csv_text)
+    export = client.get("/batch/1/export.csv").data.decode("utf-8-sig")
+    lines = [line for line in export.splitlines() if line.startswith("H1")]
+    assert len(lines) == 1
+    assert "12000" in lines[0] and "按年整租" not in lines[0]
+
+
+def test_interrupted_import_cleans_up_and_propagates(client, monkeypatch):
+    """A BaseException mid-import removes the unpublished batch."""
+    import main
+    upload(client)  # batch 1 exists
+    original = main.storage.write_households
+    calls = {"n": 0}
+
+    def interrupt(connection, batch_id, households):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise KeyboardInterrupt()
+        return original(connection, batch_id, households)
+
+    monkeypatch.setattr(main.storage, "write_households", interrupt)
+    monkeypatch.setattr(main, "IMPORT_CHUNK", 2)
+    with pytest.raises(KeyboardInterrupt):
+        client.post("/upload", data={
+            "csv_file": (io.BytesIO(CSV_TEXT.encode()), "answers.csv"),
+            "json_file": (io.BytesIO(json.dumps(JUMPS).encode()), "jumps.json"),
+        }, content_type="multipart/form-data")
+
+    connection = main.get_db()
+    try:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM batches").fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM batches WHERE status = 'importing'"
+        ).fetchone()[0] == 0
+    finally:
+        connection.close()
+    assert client.get("/batch/2").status_code == 404
+
+
+def test_export_csv_has_bom_and_streams_many_rows(client, monkeypatch):
+    import main
+    monkeypatch.setattr(main, "IMPORT_CHUNK", 1)
+    lines = [CSV_TEXT.splitlines()[0]]
+    for i in range(400):
+        lines.append("H%03d,自购,喷药机,2,无,,,1%03d" % (i, i))
+    upload(client, csv_text="\n".join(lines) + "\n")
+    data = client.get("/batch/1/export.csv").data
+    assert data.startswith(b"\xef\xbb\xbf")
+    text = data.decode("utf-8-sig")
+    assert len(text.splitlines()) == 401

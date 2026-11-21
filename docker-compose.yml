@@ -8,6 +8,13 @@ services:
     environment:
       SURVEY_DB: /data/survey.sqlite3
       SURVEY_SECRET: ${SURVEY_SECRET:-change-me-in-production}
+      # Cap the process address space (MiB).  Imports stream, so 2–3 MB
+      # uploads stay far below this; the cap turns a memory regression into a
+      # clean import failure instead of an OOM kill.
+      SURVEY_MEMORY_LIMIT_MB: ${SURVEY_MEMORY_LIMIT_MB:-192}
+    # Mirror the address-space cap at the container level.  The app also sets
+    # RLIMIT_AS itself so it works outside Docker too.
+    mem_limit: ${SURVEY_MEMORY_LIMIT_MB:-192}m
     volumes:
       - survey-data:/data
     restart: unless-stopped

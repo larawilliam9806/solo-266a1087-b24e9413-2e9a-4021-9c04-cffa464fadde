@@ -2,6 +2,8 @@ import json
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "app"))
 
@@ -105,3 +107,46 @@ def test_bare_jump_table_without_order_uses_csv_columns():
     assert [q["id"] for q in definition] == ["Q1", "Q2", "Q3"]
     stored = importer.to_import_answers(definition, rows)["H1"]
     assert stored == {((), "Q1"): "租赁", (("Q1",), "Q3"): "100"}
+
+
+def test_streamed_plan_does_not_keep_rows():
+    """The plan yields cleaned rows lazily and retains no data rows."""
+    plan = importer.plan_import(CSV_TEXT.encode("utf-8"),
+                                json.dumps(JUMPS).encode("utf-8"))
+    try:
+        first = list(plan.cleaned_rows())
+        second = list(plan.cleaned_rows())
+    finally:
+        plan.close()
+    assert first == second
+    assert first[1][0] == "H2"
+    # The plan holds no household rows: its only list attributes are the
+    # (bounded) warnings and the *definition*, never parsed data.
+    for name, value in vars(plan).items():
+        if isinstance(value, list):
+            assert name in ("warnings", "definition", "headers"), name
+    assert plan.definition
+
+
+def test_plan_rejects_before_any_write():
+    with pytest.raises(importer.ImportError_):
+        importer.plan_import(b"", b"{}")
+
+
+def test_gbk_file_with_long_ascii_prefix(tmp_path):
+    """A GBK file whose header is ASCII must not be misread as UTF-8."""
+    rows = ["household_no," + ",".join("Q%d" % i for i in range(1, 40))]
+    for h in range(400):
+        rows.append("H%04d," % h + ",".join("abc" for _ in range(39)))
+    rows.append("H9999," + ",".join(["租赁"] + ["x"] * 38))
+    raw = ("\n".join(rows) + "\n").encode("gbk")
+    jumps = {"order": ["Q%d" % i for i in range(1, 40)],
+             "jumps": {"Q1": {"租赁": "Q2"}},
+             "options": {"Q1": ["租赁"]}}
+    plan = importer.plan_import(raw, json.dumps(jumps).encode())
+    try:
+        last = list(plan.cleaned_rows())[-1]
+    finally:
+        plan.close()
+    assert last[0] == "H9999"
+    assert last[2][((), "Q1")] == "租赁"
